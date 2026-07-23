@@ -1,2 +1,172 @@
-# MSF-UDE
-A method to jointly estimate effective reproduction numbers and variant fitness using a multi-strain mechanistic compartmental system with time varying properties as neural functions learned in a stiff ODE solver.
+# MSF-UDE — Multi-Strain Fitness via Universal Differential Equations
+
+A method to **jointly** estimate effective reproduction numbers (`Rt`) and variant
+fitness from epidemic data, by fitting a single mechanistic multi-strain
+compartmental model whose time-varying quantities are **neural functions learned
+inside a stiff ODE solver**.
+
+This repository is the **early-stage testbed** for that program: minimal, readable
+simulators and inference scripts that establish the mechanics and stress-test the
+central identifiability question *before* any real data or probabilistic layer is
+added.
+
+---
+
+## Why this project exists
+
+Current practice estimates the overall time-varying reproduction number `Rt` and
+per-variant growth advantages in **two separate steps**, converting a growth
+advantage into a relative reproduction number by plugging in a fixed
+generation-time assumption. That split:
+
+- severs uncertainty propagation between the two estimates, and
+- inherits the generation-interval bias of Wallinga & Lipsitch (2007).
+
+MSF-UDE instead fits one mechanistic system in which the unknown time-varying
+drivers — overall transmission and per-variant **log-fitness** `s(t)` — are neural
+functions learned inside a real ODE integrator. The scientific core is an
+**identifiability-aware decomposition** of *effective* fitness into intrinsic
+transmissibility versus differential susceptible depletion / immune escape.
+
+The full research plan (research questions, model spec, phased roadmap, references)
+lives in [`multistrain_fitness_ude_project.md`](multistrain_fitness_ude_project.md),
+with practical recipes in
+[`multistrain_fitness_ude_cookbook.md`](multistrain_fitness_ude_cookbook.md).
+
+---
+
+## The core idea in one model
+
+A two-strain SIR with a shared susceptible pool. Variant A is the reference; variant
+B's transmission is scaled by a (possibly time-varying) log-fitness `s`:
+
+```
+βB(t) = βA · exp(s(t))          # s > 0 ⇒ B is intrinsically fitter
+```
+
+The **observable** signal is variant B's share of new infections,
+
+```
+freqB(t) = incB / (incA + incB)
+```
+
+and the inference problem is to recover `s` (a scalar, or a function `s(t)`) from
+`freqB`. The mechanism is embedded in a stiff ODE, so the physics is enforced
+exactly by the solver rather than through a soft penalty.
+
+---
+
+## What's here — file by file
+
+The scripts form a deliberate progression from "does the forward model behave" to
+"can we recover the unknown" to "can we even tell two mechanisms apart."
+
+### Forward simulation (Phase 0 sanity checks)
+
+- **[`two_strain_sim.py`](two_strain_sim.py)** — Baseline two-strain SIR forward
+  simulation with a **fixed** fitness advantage (`βB = 0.45 > βA = 0.30`). Produces
+  the two signals the whole project revolves around: total incidence and `freqB`.
+  Includes a population-conservation sanity check.
+
+### Inverse problem — recovering fitness (Phase 1)
+
+- **[`fitness_recovery.py`](fitness_recovery.py)** — Simplest inverse problem:
+  recover a **single scalar** `s` from `freqB` using a diffrax ODE + Adam. The true
+  `s = 0.4` is recovered from a deliberately wrong starting guess (`s = 0`). This
+  validates the "neural term inside a real solver, differentiate through it" loop on
+  one parameter.
+
+- **[`neural_s.py`](neural_s.py)** — The UDE step: `s` becomes a **time-varying
+  function `s(t)`** represented by a small MLP (time → fitness), learned inside the
+  stiff ODE. The truth is a hidden S-shaped rise (`0.1 → 0.5`); the network recovers
+  it from `freqB` alone. Produces comparison plots (true vs. recovered `s(t)`, and
+  observed vs. fitted `freqB`), saved to `neural_s_fit.png`.
+
+### Identifiability experiment (`identifiability-test/`) — the make-or-break test
+
+This directory implements the project's central risk (RQ2): a rising variant-B share
+can come from **intrinsic fitness** *or* from **immune escape** (B reinfecting people
+recovered from A). These can produce nearly identical `freqB` curves. If the neural
+model can't tell them apart, it will confidently report a wrong mechanism.
+
+- **[`two-phase-simulate1.py`](identifiability-test/two-phase-simulate1.py)** —
+  *Intrinsic-fitness* scenario: B is genuinely more transmissible (`βB = 0.45`).
+
+- **[`two-phase-simulate2.py`](identifiability-test/two-phase-simulate2.py)** —
+  *Immune-escape* scenario: A and B are **equally transmissible**
+  (`βA = βB = 0.30`), but a fraction (`par_sus = 0.7`) of A-recovereds flow into an
+  extra partially-susceptible pool `S_b` that only B can reinfect. B's rising share
+  now comes purely from escape — the true intrinsic advantage is exactly zero.
+
+- **[`neural_s_immune_escape.py`](identifiability-test/neural_s_immune_escape.py)** —
+  The confounding demonstration. Data is generated by the **immune-escape** model
+  above (true intrinsic `s = 0`), but the **fitting** model is the fitness UDE from
+  `neural_s.py`, which has no `S_b` compartment and can only explain a rising `freqB`
+  through intrinsic fitness. Result: the network fits `freqB` almost perfectly while
+  **inventing a positive, rising `s(t)`** (≈ +0.7 by day 150) that does not exist.
+  This is the identifiability failure the full model's controls (asymmetric capacity,
+  serology anchors, mechanistic depletion) are designed to break.
+
+### Writeup
+
+- **[`report.tex`](report.tex)** / `report.pdf` — Manuscript skeleton
+  (abstract + section stubs) for the eventual methods paper.
+
+---
+
+## Stack
+
+Python + JAX ecosystem:
+
+- **[JAX](https://github.com/google/jax)** — autodiff and JIT.
+- **[diffrax](https://github.com/patrick-kidger/diffrax)** — differentiable ODE
+  solvers (`Tsit5`, PID step control); we differentiate through the integrator.
+- **[optax](https://github.com/google-deepmind/optax)** — Adam optimizer.
+- **SciPy** (`solve_ivp`) — trusted forward simulation to generate ground-truth data.
+- **matplotlib** — plots.
+
+> The project plan flags **Julia SciML** as the alternative stack for the mature
+> phases (stiffer solvers, adjoint sensitivity); these Python scripts are the fast
+> iteration testbed.
+
+### Setup
+
+```bash
+pip install jax jaxlib diffrax optax scipy numpy matplotlib
+```
+
+### Running
+
+Each script is standalone:
+
+```bash
+python two_strain_sim.py                              # forward sim + signal plots
+python fitness_recovery.py                            # recover scalar s
+python neural_s.py                                    # recover s(t); writes neural_s_fit.png
+python identifiability-test/two-phase-simulate2.py    # immune-escape forward sim
+python identifiability-test/neural_s_immune_escape.py # the confounding demonstration
+```
+
+---
+
+## Status and roadmap
+
+This repo covers **Phase 0 (scaffolding)** and the start of **Phase 1 (simulation
+testbed + identifiability probe)** from the project plan. Still ahead: likelihood-based
+observation models (negative-binomial cases, multinomial sequences, wastewater
+shedding operator), stage-structured generation intervals, a probabilistic output
+layer for calibrated posteriors, and a real-data SARS-CoV-2 case study. See
+[`multistrain_fitness_ude_project.md`](multistrain_fitness_ude_project.md) §6 for the
+full phased roadmap and deliverables.
+
+---
+
+## Key references
+
+- Wallinga & Lipsitch (2007), *Proc. R. Soc. B* — generation intervals ↔ `Rt`.
+- Figgins & Bedford (2022) — variant `Rt` differences (GARW).
+- Obermeyer et al. (2022), *Science* — mutation-level fitness (PyR0).
+- Rackauckas et al. (2020) — Universal Differential Equations.
+- Qin (2026), arXiv:2605.30382 — growth-rate ↔ reproduction-number bridge.
+
+(Full annotated list in the project document.)
