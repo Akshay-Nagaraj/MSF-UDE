@@ -1,0 +1,164 @@
+# Joint Probabilistic Estimation of Variant Fitness and Effective Reproduction Numbers via a Multi-Strain Universal Differential Equation
+
+**Working name:** MSF-UDE (Multi-Strain Fitness — Universal Differential Equation)
+
+---
+
+## 1. One-paragraph summary
+
+Current practice estimates the overall time-varying reproduction number `Rt` and variant-specific growth advantages in two separate downstream analyses, converting growth advantage to a relative reproduction number by plugging in a fixed generation-time assumption. This severs uncertainty propagation between the two and silently inherits the generation-interval bias documented by Wallinga & Lipsitch (2007). MSF-UDE fits a single mechanistic multi-strain compartmental system in which the unknown time-varying quantities — the overall transmission driver and the per-variant log-fitness — are neural functions learned inside a stiff ODE solver, with case, wastewater, sequence, and severity data entering through likelihood-based observation models, and with a probabilistic output layer delivering **calibrated posteriors** over `Rt`, variant fitness, and their contrasts. The scientific core is an explicit, identifiability-aware decomposition of *effective* fitness into intrinsic transmissibility versus differential susceptible depletion / immune escape.
+
+---
+
+## 2. Motivation and the specific gap
+
+Every component exists in isolation; the object below does not.
+
+- PINN/UDE epidemic models recover single-strain time-varying `Rt` (Song & Xiao 2022; Grimm et al. 2024; Nguyen et al. 2023) but do **not** resolve co-circulating variants.
+- Genomic fitness models (Figgins & Bedford 2022 GARW; Obermeyer et al. 2022 PyR0) estimate variant growth advantage but are phenomenological about the mechanistic `Rt` engine and carry no severity/virulence channel.
+- Qin (2026) supplies the theoretical bridge (growth-rate difference ↔ `Rt` contrast) but proves the clean scalar mapping only under equal generation times and complete cross-immunity — precisely the special case a genuine multi-strain model leaves.
+- Uncertainty quantification for epidemic PINNs/UDEs is thin, yet Gostic et al. (2020) show that failing to propagate uncertainty can falsely imply that credible intervals have crossed the `R = 1` threshold.
+
+**Gap statement:** no published model couples multi-strain variant fitness, overall `Rt`, and (optionally) virulence in a single uncertainty-propagating neural-ODE, with a mechanistic generation-interval bridge and an explicit intrinsic-vs-escape decomposition.
+
+---
+
+## 3. Research questions
+
+1. **RQ1 (integration).** Does joint inference of `Rt` and variant fitness produce better-calibrated fitness posteriors than the standard two-step pipeline, measured by interval coverage on data where ground truth is known?
+2. **RQ2 (identifiability).** Under what data conditions (sequence sampling density, availability of serology) is intrinsic transmissibility separable from differential susceptible depletion / immune escape, rather than the two trading off along a posterior ridge?
+3. **RQ3 (bridge fidelity).** How much does making the generation-interval structure mechanistic (stage-structured) change the recovered variant-`Rt` contrasts versus the implicit-exponential (plain-SIR) assumption?
+4. **RQ4 (virulence, stretch).** Can a transmission–severity relationship be identified at all from case + wastewater + sequence + severity streams, or does it return the prior?
+
+---
+
+## 4. Model specification
+
+### 4.1 Mechanistic backbone (multi-strain, stage-structured)
+
+A multi-strain SEIR with Erlang/gamma-distributed latent and infectious stages (k sub-compartments each), so the generation-interval distribution is **mechanistically encoded** rather than implicitly exponential. For variants `v = 1..V`:
+
+- Shared or variant-specific susceptible pool(s) `S` (a modeling switch — see 4.4).
+- Per-variant exposed/infectious stage chains `E_{v,1..k}`, `I_{v,1..k}`.
+- Recovered / immune-history compartment(s) `R`, with optional waning (`SIRS`) for endemic dynamics.
+
+Force of infection for variant `v`:
+
+```
+λ_v(t) = β0 * exp(f_v(t)) * (Σ_j I_{v,j}) / N
+```
+
+where `β0` is a baseline and `f_v(t)` is the **log-fitness** of variant `v` (reference variant fixed at `f = 0`).
+
+### 4.2 Learned time-varying terms (the UDE / neural part)
+
+Two low-capacity neural functions of time (deliberately *not* equal capacity, to break the RQ2 ridge):
+
+- `u(t)` — overall transmission driver (behavioral/seasonal), moderate flexibility.
+- `f_v(t)` — per-variant log-fitness, **low degrees of freedom** (small MLP or penalized spline) with a strong smoothness / random-walk prior, mirroring GARW but nested inside the mechanistic ODE.
+
+Overall `Rt` is then a mechanistic output: `Rt(t) = (Σ_v frequency_v(t) * Rt_v(t))`, with `Rt_v` derived from `β0·exp(f_v)`, the stage structure, and the current susceptible fraction — i.e. the r→R bridge is generated by the model, not assumed.
+
+### 4.3 Observation models (one per data stream — no naive L2)
+
+- **Cases:** Negative-binomial around modeled incidence, with a reporting-delay convolution and a smooth ascertainment factor.
+- **Sequences:** Multinomial over modeled variant frequencies (this is where the fitness signal lives).
+- **Wastewater:** Explicit shedding-kinetics operator mapping incidence → RNA concentration; flag/parameterize per-variant shedding differences (else wastewater biases fitness).
+- **Severity (optional, RQ4):** Variant-stratified hospitalizations/deaths via a lagged IFR/IHR operator; the *only* channel carrying virulence information.
+
+### 4.4 Identifiability controls (core contribution)
+
+- Asymmetric capacity between `u(t)` and `f_v(t)`.
+- Let the ODE generate susceptible depletion mechanistically; restrict `f_v(t)` toward a *residual* after mechanistic depletion.
+- Bring in external immunity/serology data (or a PyR0-style mutation-level parameterization of `f_v`) to anchor intrinsic vs. escape.
+- A modeling switch between shared vs. variant-specific susceptible pools to test Qin's boundary explicitly.
+
+---
+
+## 5. Inference engine
+
+**Primary route — probabilistic UDE.** Neural terms embedded in a stiff ODE solved by a real integrator (physics enforced exactly, avoiding PINN residual-weighting and stiffness pathologies), with a probabilistic layer for UQ.
+
+- Deterministic warm start (MAP/point UDE) → then Bayesian layer.
+- UQ options in increasing cost/fidelity: **deep ensemble** or **SWAG** (cheap, first), → **Bayesian last-layer / SVI**, → **full HMC/NUTS** on the low-dimensional parameter block. Prefer HMC where tractable (B-PINN evidence: HMC > VI; dropout inadequate).
+
+**Comparison route — Bayesian PINN.** Same generative structure fit as a B-PINN (NTK-adaptive loss weighting + Fourier features for the sharp variant transitions) to benchmark engine-vs-engine on the same problem.
+
+---
+
+## 6. Implementation phases
+
+### Phase 0 — Scaffolding
+- Choose stack: **Julia SciML** (`DifferentialEquations.jl`, `Lux.jl`, `SciMLSensitivity.jl`, `Turing.jl`) *or* **Python/JAX** (`diffrax`, `equinox`, `numpyro`). Julia recommended for stiff-solver + adjoint maturity.
+- Implement the stage-structured multi-strain SEIR(S) as a plain ODE; verify conservation and reduce-to-SIR sanity checks.
+
+### Phase 1 — Simulation testbed & identifiability probe (do this before any real data)
+- Generate synthetic epidemics with **known** `Rt`, `f_v`, generation-interval structure. Reuse Qin's SIR-simulation benchmark (mapping recovered at slope ≈ 0.99 when true `Rt` known) as an external check.
+- Fit the point UDE; confirm recovery of `(Rt, f_v)`.
+- **Deliberately test RQ2:** construct two ground-truth scenarios that produce identical variant-share curves — one via intrinsic fitness, one via differential depletion — and check whether the model distinguishes them or picks a ridge point. This is the make-or-break experiment.
+
+### Phase 2 — Single-region joint model, two data streams
+- Add negative-binomial case likelihood + multinomial sequence likelihood.
+- Fit `u(t)` and `f_v(t)` jointly; compare against a two-step baseline (estimate `Rt` then fit GARW downstream) on the *same* synthetic data.
+- Metric: posterior **coverage/calibration** of `f_v` and `Rt`, not just RMSE (this answers RQ1).
+
+### Phase 3 — Add streams and mechanism
+- Add wastewater with shedding operator; test the per-variant-shedding trap.
+- Switch on stage structure variants to quantify the exponential-vs-gamma generation-interval effect on variant-`Rt` contrasts (RQ3).
+
+### Phase 4 — Uncertainty quantification
+- Layer ensemble/SWAG → SVI → HMC; check calibration explicitly at each step (do not assume it).
+- Report credible intervals on all of: `Rt(t)`, `f_v(t)`, `Rt_v` contrasts, and the intrinsic-vs-escape split.
+
+### Phase 5 — Real data + validation
+- Apply to a documented SARS-CoV-2 transition (e.g. an Omicron sub-lineage takeover) with public case, GISAID sequence, and wastewater data.
+- Retrospective check: does the model flag the emerging fitness advantage weeks ahead (Qin reports 43–65 days pre-dominance)?
+- Cross-region concordance: direction of fitness signal should be consistent while magnitude varies with immune landscape.
+
+### Phase 6 (stretch) — Virulence
+- Add variant-stratified severity stream + lagged IHR/IFR operator; attempt the transmission–severity coupling. **Expect** the data may reject an assumed trade-off shape; report identifiability honestly rather than forcing a coefficient.
+
+---
+
+## 7. Training pathologies to pre-empt
+
+| Pathology | Symptom in this problem | Mitigation |
+|---|---|---|
+| Loss imbalance | Fits data, violates ODE | UDE (exact solver) or NTK-adaptive weighting |
+| Spectral bias | Misses sharp variant crossover | Fourier features; fit frequencies in logit space |
+| Ill-conditioning / stiffness | Bad local optima; endemic dynamics stiff | Stiff solver; asymptotic-preserving / stabilized training |
+| Non-identifiability | Confident wrong split of fitness | Asymmetric capacity, priors, serology anchor (Phase 1/4) |
+
+---
+
+## 8. Deliverables and milestones
+
+1. **M1** — Open simulation testbed + identifiability experiment (Phase 1). *Publishable methods note on its own.*
+2. **M2** — Joint vs. two-step calibration result on synthetic data (Phase 2, answers RQ1).
+3. **M3** — Full multi-stream probabilistic model with UQ (Phases 3–4).
+4. **M4** — Real-data case study with retrospective early-warning and cross-region checks (Phase 5).
+5. **M5** (stretch) — Virulence identifiability analysis (Phase 6).
+
+**Recommended minimum publishable unit:** M1 + M2. Drop virulence unless M4 is clean.
+
+---
+
+## 9. Key references
+
+- Wallinga J, Lipsitch M (2007). How generation intervals shape the relationship between growth rates and reproductive numbers. *Proc. R. Soc. B.*
+- Gostic KM et al. (2020). Practical considerations for measuring the effective reproductive number, Rt. *PLOS Comput. Biol.*
+- Figgins MD, Bedford T (2022). SARS-CoV-2 variant dynamics across US states show consistent differences in effective reproduction numbers. *medRxiv.*
+- Obermeyer F et al. (2022). Analysis of 6.4 million SARS-CoV-2 genomes identifies mutations associated with fitness (PyR0). *Science.*
+- Abousamra E, Figgins M, Bedford T (2024). Fitness models provide accurate short-term forecasts of SARS-CoV-2 variant frequency. *PLOS Comput. Biol.*
+- Qin H (2026). On the Connection Between Differential Population Growth Rate and Epidemic Reproduction Numbers. *arXiv:2605.30382.*
+- Rackauckas C et al. (2020). Universal Differential Equations for Scientific Machine Learning. *arXiv:2001.04385.*
+- Song J, Xiao Y (2022). Estimating time-varying reproduction number by deep learning techniques. *J. Appl. Anal. Comput.*
+- Kim S, Ji W, Deng S, Ma Y, Rackauckas C (2021). Stiff neural ordinary differential equations. *Chaos.*
+- Yang L, Meng X, Karniadakis GE (2021). B-PINNs: Bayesian physics-informed neural networks for forward and inverse PDE problems with noisy data. *J. Comput. Phys.*
+- Kharazmi E, Cai M, Zheng X, Zhang Z, Lin G, Karniadakis GE (2021). Identifiability and predictability of integer- and fractional-order epidemiological models using PINNs. *Nat. Comput. Sci.*
+- Grimm V et al. (2024). A Physics-Informed Neural Network approach for compartmental epidemiological models. *PLOS Comput. Biol.* (arXiv:2311.09944)
+- Wang S, Yu X, Perdikaris P (2022). When and why PINNs fail to train: an NTK perspective. *J. Comput. Phys.*
+- Krishnapriyan A et al. (2021). Characterizing possible failure modes in physics-informed neural networks. *NeurIPS.*
+- Tancik M et al. (2020). Fourier features let networks learn high-frequency functions in low-dimensional domains. *NeurIPS.*
+
+*Note: verify exact venue/year for a few preprint-stage references (Figgins & Bedford, Qin) before submission; some may have updated peer-reviewed versions.*
